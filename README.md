@@ -26,7 +26,7 @@ Downloads folder.
 **Step 2 -- Unzip the downloaded file**
 
 Open your Downloads folder and double-click the ZIP file. macOS will automatically unpack it
-into a folder called `orca-browser-bridge-main` (or similar) in the same location.
+into a folder called `orca-browser-bridge-main` (or similar) in the same location. Move the unzipped folder somewhere on your machine that won't be deleted, like /documents or similar.
 
 **Step 3 -- Open the Chrome extensions page**
 
