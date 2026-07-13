@@ -578,30 +578,72 @@
     return img?.getAttribute('alt')?.trim() || null
   }
 
+  // Structural report used when the conversation list can't be found, so the
+  // desktop surfaces the REAL DOM shape instead of us guessing selectors.
+  function linkedinMessagingDiagnostics() {
+    const sel = (s) => document.querySelectorAll(s).length
+    const diag = {
+      url: location.href,
+      threadLinks: sel('a[href*="/messaging/thread/"]'),
+      liItems: sel('li.msg-conversation-listitem'),
+      convItemsAlt: sel('[class*="conversation-listitem"]'),
+      convCards: sel('[class*="conversation-card"]'),
+      listContainers: sel('[class*="conversations-container"]'),
+      ariaListboxes: sel('[role="listbox"], [role="list"]'),
+      msgOverlay: sel('[class*="msg-overlay"]'),
+    }
+    // Sample the class names of the first few list-ish <li>/<a> so we can see
+    // the current markup vocabulary.
+    const sample = []
+    document.querySelectorAll('a[href*="/messaging/thread/"]').forEach((a, i) => {
+      if (i >= 3) return
+      const li = a.closest('li') || a.parentElement
+      sample.push({
+        aClass: a.className.slice(0, 200),
+        liTag: li ? li.tagName : null,
+        liClass: li ? li.className.slice(0, 200) : null,
+      })
+    })
+    diag.sample = sample
+    return diag
+  }
+
   async function linkedinListConversations(limit, unreadOnly) {
     if (!location.pathname.startsWith('/messaging')) {
       return { error: 'Not on the messaging page', url: location.href }
     }
     const maxItems = Math.min(limit || 25, 100)
 
-    // Give the SPA a moment if the list hasn't rendered yet (background tabs load lazily)
-    const firstItem = await waitForElement(LI_CONVO_ITEM_SELECTORS, 8000)
-    if (!firstItem) return { error: 'LinkedIn conversation list not found (DOM change or page not loaded)' }
+    // Anchor-first strategy: the thread link href is the single most stable
+    // hook (it carries the conversation id). Wait for at least one, then work
+    // outward to its list item. This sidesteps LinkedIn's volatile item/card
+    // class names entirely.
+    const anchor = await waitForElement(['a[href*="/messaging/thread/"]'], 12000)
+    if (!anchor) {
+      return {
+        error: 'LinkedIn conversation list not found (no thread links rendered)',
+        diagnostics: linkedinMessagingDiagnostics(),
+      }
+    }
 
-    const items = document.querySelectorAll(LI_CONVO_ITEM_SELECTORS.join(', '))
+    const links = Array.from(document.querySelectorAll('a[href*="/messaging/thread/"]'))
     const conversations = []
+    const seenUrns = new Set()
 
-    for (let i = 0; i < items.length && conversations.length < maxItems; i++) {
-      const item = items[i]
-      const link = findWithin(item, LI_CONVO_LINK_SELECTORS)
-      const urn = extractThreadUrn(link?.getAttribute('href'))
-      if (!urn) continue
+    for (const link of links) {
+      if (conversations.length >= maxItems) break
+      const urn = extractThreadUrn(link.getAttribute('href'))
+      if (!urn || seenUrns.has(urn)) continue
+
+      // The list item is the nearest <li>, else the link's card ancestor.
+      const item = link.closest('li') || link.closest('[class*="conversation"]') || link
 
       const name = findWithin(item, [
         '.msg-conversation-listitem__participant-names',
         '.msg-conversation-card__participant-names',
+        '[class*="participant-names"]',
         'h3',
-      ])?.textContent?.trim() || ''
+      ])?.textContent?.trim() || link.getAttribute('aria-label')?.trim() || ''
 
       const snippet = findWithin(item, [
         '.msg-conversation-card__message-snippet',
@@ -609,26 +651,25 @@
         'p',
       ])?.textContent?.trim() || ''
 
-      const timeText = findWithin(item, ['time'])?.textContent?.trim() || ''
-      const timeAttr = findWithin(item, ['time'])?.getAttribute('datetime') || null
-
+      const timeEl = findWithin(item, ['time'])
       const unread =
-        item.className.includes('unread') ||
-        !!item.querySelector('.notification-badge, [class*="unread-count"]')
+        /unread/i.test(item.className) ||
+        !!item.querySelector('.notification-badge, [class*="unread"]')
 
       if (unreadOnly && !unread) continue
 
+      seenUrns.add(urn)
       conversations.push({
         conversation_urn: urn,
         sender_name: name,
         snippet: snippet.slice(0, 300),
-        time_text: timeText,
-        time_attr: timeAttr,
+        time_text: timeEl?.textContent?.trim() || '',
+        time_attr: timeEl?.getAttribute('datetime') || null,
         unread,
       })
     }
 
-    return { count: conversations.length, total_items: items.length, conversations }
+    return { count: conversations.length, total_items: links.length, conversations }
   }
 
   async function linkedinOpenThread(conversationUrn) {
