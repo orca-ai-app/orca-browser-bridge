@@ -56,6 +56,20 @@
         harvestResolveUrl(msg.menuLabel).then(sendResponse)
         return true
 
+      // LinkedIn messaging (godmode inbox triage) — runs in a BACKGROUND tab,
+      // nothing here may assume window focus.
+      case 'orca-linkedin-list-conversations':
+        linkedinListConversations(msg.limit, msg.unreadOnly).then(sendResponse)
+        return true
+
+      case 'orca-linkedin-read-thread':
+        linkedinReadThread(msg.conversationUrn, msg.lastN).then(sendResponse)
+        return true
+
+      case 'orca-linkedin-send-dm':
+        linkedinSendDm(msg.conversationUrn, msg.textBase64).then(sendResponse)
+        return true
+
       default:
         // Don't respond to overlay messages (handled by overlay.js)
         if (action?.startsWith('orca_')) return false
@@ -72,8 +86,31 @@
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
+  // Find the post BODY text within a post root, resilient to LinkedIn's
+  // volatile class names. Prefers the dedicated text component; falls back to
+  // the longest break-words block (the body is longer than the author
+  // headline, which also uses break-words). Returns '' if nothing usable.
+  function harvestExtractBody(root) {
+    if (!root) return ''
+    const specific = root.querySelector(
+      '.update-components-text, .feed-shared-update-v2__description, .feed-shared-inline-show-more-text'
+    )
+    if (specific && specific.innerText && specific.innerText.trim()) {
+      return specific.innerText.trim().substring(0, 1500)
+    }
+    let best = ''
+    root.querySelectorAll('.break-words').forEach((el) => {
+      const t = (el.innerText || '').trim()
+      if (t.length > best.length) best = t
+    })
+    return best.substring(0, 1500)
+  }
+
   // Scroll to load lazy posts, then extract per-post metadata from the
-  // control-menu buttons. Returns { posts: [{author_hint, context, menu_label, degree}] }.
+  // control-menu buttons. Returns
+  // { posts: [{author_hint, context, body, menu_label, degree}] }.
+  // `context` keeps the old author+header chrome (used for the degree badge and
+  // back-compat); `body` is the actual post text the draft model should use.
   async function harvestExtractMetas() {
     try {
       window.scrollBy(0, 2000)
@@ -88,23 +125,32 @@
         const m = label.match(/Open control menu for post by (.+)/)
         const authorName = m ? m[1].trim() : 'Unknown'
 
-        let container = btn.parentElement
-        while (
-          container &&
-          container.tagName !== 'BODY' &&
-          (!container.innerText || container.innerText.length < 150)
-        ) {
-          container = container.parentElement
+        // Prefer the actual post root so the body element can be targeted;
+        // fall back to the legacy walk-up (first ancestor with enough text).
+        // The walk-up alone stops at a long author-header block and misses the
+        // body, which produced the "[Draft generation failed]" cards.
+        let root = btn.closest('.feed-shared-update-v2, [data-urn]')
+        if (!root) {
+          root = btn.parentElement
+          while (
+            root &&
+            root.tagName !== 'BODY' &&
+            (!root.innerText || root.innerText.length < 150)
+          ) {
+            root = root.parentElement
+          }
         }
+
         const context =
-          container && container.tagName !== 'BODY' ? container.innerText.substring(0, 600) : ''
+          root && root.tagName !== 'BODY' ? (root.innerText || '').substring(0, 1500) : ''
+        const body = harvestExtractBody(root)
 
         let deg = 'none'
         if (/·\s*1st/.test(context) || (context.indexOf(' 1st') > -1 && context.indexOf('1st connections') === -1)) deg = '1st'
         else if (/·\s*2nd/.test(context) || context.indexOf(' 2nd') > -1) deg = '2nd'
         else if (/·\s*3rd/.test(context) || context.indexOf(' 3rd') > -1) deg = '3rd+'
 
-        posts.push({ author_hint: authorName, context, menu_label: label, degree: deg })
+        posts.push({ author_hint: authorName, context, body, menu_label: label, degree: deg })
         if (posts.length >= 8) break
       }
       return { posts }
@@ -492,6 +538,209 @@
   }
 
   // ============================================================
+  // LinkedIn messaging handlers (inbox triage)
+  //
+  // These run in a BACKGROUND tab — nothing here may assume window focus.
+  // Selectors are fallback arrays because LinkedIn's DOM rots without notice;
+  // when all fallbacks miss, return a structured error so the scheduler's
+  // health manager can back off and eventually alert.
+  // ============================================================
+
+  const LI_CONVO_ITEM_SELECTORS = [
+    'li.msg-conversation-listitem',
+    '.msg-conversations-container__convo-item',
+    'li[class*="conversation-listitem"]',
+  ]
+  const LI_CONVO_LINK_SELECTORS = [
+    'a.msg-conversation-listitem__link',
+    'a[href*="/messaging/thread/"]',
+  ]
+  const LI_COMPOSE_SELECTORS = [
+    'div.msg-form__contenteditable[contenteditable="true"]',
+    'form.msg-form div[contenteditable="true"][role="textbox"]',
+    'div[contenteditable="true"][aria-label*="message"]',
+  ]
+  const LI_SEND_BTN_SELECTORS = [
+    'button.msg-form__send-button',
+    'form.msg-form button[type="submit"]',
+    'button[class*="msg-form__send"]',
+  ]
+
+  function extractThreadUrn(href) {
+    // hrefs look like /messaging/thread/2-MTIzNDU2Nzg5…==/ — the segment IS the id
+    const m = (href || '').match(/\/messaging\/thread\/([^/?#]+)/)
+    return m ? decodeURIComponent(m[1]) : null
+  }
+
+  // The signed-in account's display name, for message direction attribution.
+  function linkedinOwnName() {
+    const img = document.querySelector('img.global-nav__me-photo, .global-nav__me img')
+    return img?.getAttribute('alt')?.trim() || null
+  }
+
+  async function linkedinListConversations(limit, unreadOnly) {
+    if (!location.pathname.startsWith('/messaging')) {
+      return { error: 'Not on the messaging page', url: location.href }
+    }
+    const maxItems = Math.min(limit || 25, 100)
+
+    // Give the SPA a moment if the list hasn't rendered yet (background tabs load lazily)
+    const firstItem = await waitForElement(LI_CONVO_ITEM_SELECTORS, 8000)
+    if (!firstItem) return { error: 'LinkedIn conversation list not found (DOM change or page not loaded)' }
+
+    const items = document.querySelectorAll(LI_CONVO_ITEM_SELECTORS.join(', '))
+    const conversations = []
+
+    for (let i = 0; i < items.length && conversations.length < maxItems; i++) {
+      const item = items[i]
+      const link = findWithin(item, LI_CONVO_LINK_SELECTORS)
+      const urn = extractThreadUrn(link?.getAttribute('href'))
+      if (!urn) continue
+
+      const name = findWithin(item, [
+        '.msg-conversation-listitem__participant-names',
+        '.msg-conversation-card__participant-names',
+        'h3',
+      ])?.textContent?.trim() || ''
+
+      const snippet = findWithin(item, [
+        '.msg-conversation-card__message-snippet',
+        '[class*="message-snippet"]',
+        'p',
+      ])?.textContent?.trim() || ''
+
+      const timeText = findWithin(item, ['time'])?.textContent?.trim() || ''
+      const timeAttr = findWithin(item, ['time'])?.getAttribute('datetime') || null
+
+      const unread =
+        item.className.includes('unread') ||
+        !!item.querySelector('.notification-badge, [class*="unread-count"]')
+
+      if (unreadOnly && !unread) continue
+
+      conversations.push({
+        conversation_urn: urn,
+        sender_name: name,
+        snippet: snippet.slice(0, 300),
+        time_text: timeText,
+        time_attr: timeAttr,
+        unread,
+      })
+    }
+
+    return { count: conversations.length, total_items: items.length, conversations }
+  }
+
+  async function linkedinOpenThread(conversationUrn) {
+    // Already open?
+    if (location.pathname.includes(encodeURIComponent(conversationUrn)) ||
+        location.pathname.includes(conversationUrn)) {
+      return true
+    }
+    // SPA-click the matching list item — never navigate the tab (keeps history clean
+    // and avoids a full reload in the background tab)
+    const items = document.querySelectorAll(LI_CONVO_ITEM_SELECTORS.join(', '))
+    for (const item of items) {
+      const link = findWithin(item, LI_CONVO_LINK_SELECTORS)
+      const urn = extractThreadUrn(link?.getAttribute('href'))
+      if (urn === conversationUrn && link) {
+        link.click()
+        await jitter(1200, 2200)
+        return true
+      }
+    }
+    return false
+  }
+
+  async function linkedinReadThread(conversationUrn, lastN) {
+    if (!conversationUrn) return { error: 'conversationUrn is required' }
+    const maxItems = Math.min(lastN || 10, 50)
+
+    const opened = await linkedinOpenThread(conversationUrn)
+    if (!opened) return { error: `Conversation not found in list: ${conversationUrn}` }
+
+    const firstEvent = await waitForElement([
+      'li.msg-s-message-list__event',
+      '.msg-s-event-listitem',
+      '[class*="event-listitem"]',
+    ], 8000)
+    if (!firstEvent) return { error: 'Thread messages not found (DOM change or thread failed to load)' }
+
+    const ownName = linkedinOwnName()
+    const events = document.querySelectorAll('li.msg-s-message-list__event, .msg-s-event-listitem')
+    const messages = []
+    // Sender names come from message-group headers; consecutive messages from the
+    // same sender omit the header, so carry the last seen name forward.
+    let currentSender = null
+
+    for (const ev of events) {
+      const nameEl = ev.querySelector('.msg-s-message-group__name, [class*="message-group__name"]')
+      if (nameEl) currentSender = nameEl.textContent?.trim() || currentSender
+
+      const bodyEl = ev.querySelector('.msg-s-event-listitem__body, [class*="event-listitem__body"]')
+      const text = bodyEl?.textContent?.trim()
+      if (!text) continue
+
+      const timeEl = ev.querySelector('time')
+      messages.push({
+        sender_name: currentSender || '',
+        direction: ownName && currentSender === ownName ? 'me' : 'them',
+        text: text.slice(0, 2000),
+        time_text: timeEl?.textContent?.trim() || '',
+        time_attr: timeEl?.getAttribute('datetime') || null,
+      })
+    }
+
+    // Sender profile URL from the thread header, when present
+    const profileLink = document.querySelector(
+      '.msg-thread a[href*="/in/"], .msg-title-bar a[href*="/in/"], .msg-entity-lockup a[href*="/in/"]'
+    )
+
+    return {
+      conversation_urn: conversationUrn,
+      own_name: ownName,
+      sender_profile_url: profileLink?.href || null,
+      messageCount: messages.length,
+      messages: messages.slice(-maxItems),
+    }
+  }
+
+  async function linkedinSendDm(conversationUrn, textBase64) {
+    if (!conversationUrn) return { error: 'conversationUrn is required' }
+    let text = ''
+    if (textBase64) text = decodeURIComponent(escape(atob(textBase64)))
+    if (!text) return { error: 'No message text provided' }
+
+    const opened = await linkedinOpenThread(conversationUrn)
+    if (!opened) return { error: `Conversation not found in list: ${conversationUrn}` }
+
+    const compose = await waitForElement(LI_COMPOSE_SELECTORS, 8000)
+    if (!compose) return { error: 'Could not find message compose box (DOM change?)' }
+
+    // Human-shaped step jitter. The LARGE pre-send delay (5-45s) lives in the
+    // desktop job before this command is issued — the bridge's 30s command
+    // timeout means everything in here must stay well under that.
+    compose.focus()
+    await jitter(400, 1200)
+    compose.innerHTML = ''
+    await jitter(150, 400)
+    document.execCommand('insertText', false, text)
+    compose.dispatchEvent(new Event('input', { bubbles: true }))
+    compose.dispatchEvent(new Event('change', { bubbles: true }))
+    await jitter(600, 1800)
+
+    const sendBtn = await waitForClickable(LI_SEND_BTN_SELECTORS, 4000)
+    if (!sendBtn) {
+      return { success: false, action: 'message_typed', error: 'Message typed but send button not found' }
+    }
+    await jitter(300, 900)
+    sendBtn.click()
+    await jitter(500, 1000)
+
+    return { success: true, action: 'message_sent', conversation_urn: conversationUrn }
+  }
+
+  // ============================================================
   // DOM helpers
   // ============================================================
 
@@ -501,6 +750,19 @@
       if (el) return el
     }
     return null
+  }
+
+  function findWithin(root, selectors) {
+    for (const sel of selectors) {
+      const el = root.querySelector(sel)
+      if (el) return el
+    }
+    return null
+  }
+
+  // Randomised wait — automation steps must not tick like a metronome.
+  function jitter(minMs, maxMs) {
+    return wait(minMs + Math.floor(Math.random() * (maxMs - minMs)))
   }
 
   function findStartPostButton() {

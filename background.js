@@ -6,38 +6,52 @@
  * v4: removed all Supabase credentials; all queries route to desktop over WS
  */
 
-const WS_URL = 'ws://127.0.0.1:19840'
+// Two Orca desktops can run side by side on this machine: Orca.app (orca-mac,
+// the day-to-day automation host) on 19840 and Orca Godmode (LinkedIn inbox
+// triage) on 19841. The extension maintains a socket to EACH; commands are
+// answered on the socket they arrived from, so both apps get served without
+// fighting over one port.
+const WS_ENDPOINTS = [
+  'ws://127.0.0.1:19840', // Orca.app (orca-mac)
+  'ws://127.0.0.1:19841', // Orca Godmode
+]
 const RECONNECT_BASE_MS = 1000
 const RECONNECT_MAX_MS = 30000
 
-let ws = null
-let reconnectTimer = null
-let reconnectAttempts = 0
-let connectionState = 'disconnected'
+// url -> { ws: WebSocket|null, reconnectAttempts: number, reconnectPending: boolean }
+const sockets = new Map(WS_ENDPOINTS.map((url) => [url, { ws: null, reconnectAttempts: 0, reconnectPending: false }]))
 
 // Pending query promises keyed by query_id, for WS-routed Supabase lookups.
 const pendingQueries = {}
 
 // ============================================================
-// WebSocket lifecycle
+// WebSocket lifecycle (per endpoint)
 // ============================================================
 
-function connect() {
-  if (ws && ws.readyState <= WebSocket.OPEN) return
-  setConnectionState('connecting')
+function connectAll() {
+  for (const url of WS_ENDPOINTS) connect(url)
+}
 
+function connect(url) {
+  const sock = sockets.get(url)
+  if (!sock) return
+  if (sock.ws && sock.ws.readyState <= WebSocket.OPEN) return
+
+  let ws
   try {
-    ws = new WebSocket(WS_URL)
+    ws = new WebSocket(url)
   } catch (e) {
-    console.warn('[Orca Bridge] WebSocket creation failed:', e.message)
-    scheduleReconnect()
+    console.warn(`[Orca Bridge] WebSocket creation failed (${url}):`, e.message)
+    scheduleReconnect(url)
     return
   }
+  sock.ws = ws
+  broadcastState()
 
   ws.onopen = () => {
-    console.log('[Orca Bridge] Connected to Orca')
-    setConnectionState('connected')
-    reconnectAttempts = 0
+    console.log(`[Orca Bridge] Connected to Orca (${url})`)
+    sock.reconnectAttempts = 0
+    broadcastState()
   }
 
   ws.onmessage = async (event) => {
@@ -56,7 +70,8 @@ function connect() {
         return
       }
 
-      // Desktop-initiated command request: { id, command, params }
+      // Desktop-initiated command request: { id, command, params } —
+      // answered on the socket it arrived from.
       if (msg.id && msg.command) {
         const response = await handleCommand(msg)
         ws.send(JSON.stringify(response))
@@ -68,38 +83,57 @@ function connect() {
   }
 
   ws.onclose = () => {
-    console.log('[Orca Bridge] Disconnected from Orca')
-    setConnectionState('disconnected')
-    ws = null
-    scheduleReconnect()
+    console.log(`[Orca Bridge] Disconnected from Orca (${url})`)
+    if (sock.ws === ws) sock.ws = null
+    broadcastState()
+    scheduleReconnect(url)
   }
 
   ws.onerror = () => {
-    // Connection refused is expected when Orca desktop is not running
+    // Connection refused is expected when that Orca desktop is not running
   }
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) return
-  reconnectTimer = true
-  const delaySec = Math.min(RECONNECT_BASE_MS * Math.pow(2, reconnectAttempts), RECONNECT_MAX_MS) / 1000
-  reconnectAttempts++
-  chrome.alarms.create('orca-reconnect', { delayInMinutes: delaySec / 60 })
+function scheduleReconnect(url) {
+  const sock = sockets.get(url)
+  if (!sock || sock.reconnectPending) return
+  sock.reconnectPending = true
+  const delaySec = Math.min(RECONNECT_BASE_MS * Math.pow(2, sock.reconnectAttempts), RECONNECT_MAX_MS) / 1000
+  sock.reconnectAttempts++
+  chrome.alarms.create(`orca-reconnect@${url}`, { delayInMinutes: delaySec / 60 })
 }
 
-function disconnect() {
-  chrome.alarms.clear('orca-reconnect')
-  reconnectTimer = null
-  if (ws) {
-    ws.close()
-    ws = null
+function disconnectAll() {
+  for (const [url, sock] of sockets) {
+    chrome.alarms.clear(`orca-reconnect@${url}`)
+    sock.reconnectPending = false
+    if (sock.ws) {
+      sock.ws.close()
+      sock.ws = null
+    }
+    sock.reconnectAttempts = 0
   }
-  setConnectionState('disconnected')
+  broadcastState()
 }
 
-function setConnectionState(state) {
-  connectionState = state
-  chrome.runtime.sendMessage({ type: 'status_changed', state, connected: state === 'connected', reconnectAttempts }).catch(() => {})
+function openSockets() {
+  return WS_ENDPOINTS
+    .map((url) => sockets.get(url)?.ws)
+    .filter((ws) => ws && ws.readyState === WebSocket.OPEN)
+}
+
+function anyConnected() {
+  return openSockets().length > 0
+}
+
+function broadcastState() {
+  const connected = anyConnected()
+  chrome.runtime.sendMessage({
+    type: 'status_changed',
+    state: connected ? 'connected' : 'disconnected',
+    connected,
+    reconnectAttempts: Math.max(...[...sockets.values()].map((s) => s.reconnectAttempts)),
+  }).catch(() => {})
 }
 
 // ============================================================
@@ -108,7 +142,10 @@ function setConnectionState(state) {
 
 function sendQueryToDesktop(type, payload, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+    // Overlay queries go to the first connected desktop in endpoint order
+    // (19840/Orca.app preferred — it's the daily driver with the CRM data).
+    const ws = openSockets()[0]
+    if (!ws) {
       return reject(new Error('Not connected to Orca desktop'))
     }
 
@@ -154,7 +191,7 @@ async function handleCommand(request) {
   try {
     switch (command) {
       case 'ping':
-        return success(id, { status: 'ok', version: '4.0.0' })
+        return success(id, { status: 'ok', version: '4.1.1' })
 
       case 'list_tabs':
         return await cmdListTabs(id)
@@ -197,6 +234,20 @@ async function handleCommand(request) {
 
       case 'linkedin_resolve_url':
         return await cmdLinkedinResolveUrl(id, params)
+
+      // LinkedIn messaging (godmode inbox triage) — background-tab, passive,
+      // NEVER focuses a tab or window
+      case 'linkedin_ensure_messaging_tab':
+        return await cmdLinkedInEnsureMessagingTab(id)
+
+      case 'linkedin_read_conversations':
+        return await cmdLinkedInMessagingAction(id, 'orca-linkedin-list-conversations', params, 15000)
+
+      case 'linkedin_read_thread':
+        return await cmdLinkedInMessagingAction(id, 'orca-linkedin-read-thread', params, 20000)
+
+      case 'linkedin_send_message':
+        return await cmdLinkedInMessagingAction(id, 'orca-linkedin-send-dm', params, 25000)
 
       default:
         return error(id, `Unknown command: ${command}`)
@@ -282,18 +333,26 @@ async function getTargetTabId(params) {
 }
 
 async function sendToContentScript(tabId, action, params, timeoutMs = 15000) {
+  // Ensure the content script is actually present. The previous version ran
+  // this check but ignored its result, only injecting when executeScript
+  // THREW — which never happens on a still-loading page, only on restricted
+  // ones. A freshly-created background tab would then be messaged with no
+  // listener ("Receiving end does not exist"). content.js is idempotent
+  // (window.__orcaBridgeLoaded guard), so re-injecting is a safe no-op.
+  let loaded = false
   try {
-    await chrome.scripting.executeScript({
+    const results = await chrome.scripting.executeScript({
       target: { tabId },
       func: () => !!window.__orcaBridgeLoaded,
     })
+    loaded = !!results?.[0]?.result
   } catch {
+    loaded = false
+  }
+  if (!loaded) {
     try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ['content.js'],
-      })
-      await sleep(500)
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] })
+      await sleep(400)
     } catch (e) {
       throw new Error(`Cannot inject content script: ${e.message}`)
     }
@@ -418,6 +477,68 @@ async function cmdLinkedInAction(id, action, params) {
 }
 
 // ============================================================
+// LinkedIn messaging (godmode inbox triage). Unlike cmdLinkedInAction above,
+// these NEVER call tabs.update({active:true}) — the user's desktop must not
+// move while the inbox is read or replied to in the background.
+// ============================================================
+
+const LI_MESSAGING_URL = 'https://www.linkedin.com/messaging/'
+
+// A background/pinned tab loads lazily and throttled, so wait for it to reach
+// document 'complete' on a LinkedIn URL before anyone talks to its content
+// script. Returns true once ready, false on timeout.
+async function waitForTabReady(tabId, timeoutMs = 25000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    let tab
+    try {
+      tab = await chrome.tabs.get(tabId)
+    } catch {
+      return false // tab closed
+    }
+    // A frozen/discarded background tab needs a nudge to reload.
+    if (tab.discarded) {
+      try { await chrome.tabs.reload(tabId) } catch { /* ignore */ }
+    }
+    if (tab.status === 'complete' && /linkedin\.com/.test(tab.url || '')) {
+      return true
+    }
+    await sleep(500)
+  }
+  return false
+}
+
+async function cmdLinkedInEnsureMessagingTab(id) {
+  const existing = await chrome.tabs.query({ url: '*://*.linkedin.com/messaging*' })
+  if (existing.length > 0) {
+    const ready = await waitForTabReady(existing[0].id)
+    return success(id, { tab_id: existing[0].id, created: false, ready })
+  }
+  // Created unfocused and pinned — parks quietly at the far left of the tab
+  // strip and never takes over the screen.
+  const tab = await chrome.tabs.create({ url: LI_MESSAGING_URL, active: false, pinned: true })
+  const ready = await waitForTabReady(tab.id)
+  return success(id, { tab_id: tab.id, created: true, ready })
+}
+
+async function cmdLinkedInMessagingAction(id, action, params, timeoutMs = 15000) {
+  let tabId
+  if (params?.tab_id) {
+    tabId = params.tab_id
+  } else {
+    const messagingTabs = await chrome.tabs.query({ url: '*://*.linkedin.com/messaging*' })
+    const tab = messagingTabs[0] || (await chrome.tabs.query({ url: '*://*.linkedin.com/*' }))[0]
+    if (!tab) {
+      return error(id, 'No LinkedIn tab found. Call linkedin_ensure_messaging_tab first.')
+    }
+    tabId = tab.id
+  }
+
+  const result = await sendToContentScript(tabId, action, params || {}, timeoutMs)
+  return success(id, result)
+}
+
+// ============================================================
 // v3/v4: Overlay query handler (now routes over WS to desktop)
 // ============================================================
 
@@ -514,32 +635,34 @@ function sleep(ms) {
 // ============================================================
 
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('[Orca Bridge] Extension installed (v4)')
-  connect()
+  console.log('[Orca Bridge] Extension installed (v4.1.1, dual-desktop)')
+  connectAll()
 })
 
 chrome.runtime.onStartup.addListener(() => {
   console.log('[Orca Bridge] Chrome started')
-  connect()
+  connectAll()
 })
 
-connect()
+connectAll()
 
 chrome.alarms.create('orca-keepalive', { periodInMinutes: 0.4 })
 chrome.alarms.create('orca-draft-badge', { periodInMinutes: 5 })
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'orca-keepalive') {
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    for (const ws of openSockets()) {
       ws.send(JSON.stringify({ type: 'keepalive' }))
     }
   }
   if (alarm.name === 'orca-draft-badge') {
     checkDraftBadge()
   }
-  if (alarm.name === 'orca-reconnect') {
-    reconnectTimer = null
-    connect()
+  if (alarm.name.startsWith('orca-reconnect@')) {
+    const url = alarm.name.slice('orca-reconnect@'.length)
+    const sock = sockets.get(url)
+    if (sock) sock.reconnectPending = false
+    connect(url)
   }
 })
 
@@ -547,18 +670,18 @@ checkDraftBadge()
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'get_status') {
+    const connected = anyConnected()
     sendResponse({
-      connected: connectionState === 'connected',
-      state: connectionState,
-      reconnectAttempts,
+      connected,
+      state: connected ? 'connected' : 'disconnected',
+      reconnectAttempts: Math.max(...[...sockets.values()].map((s) => s.reconnectAttempts)),
     })
     return true
   }
 
   if (msg.type === 'reconnect') {
-    disconnect()
-    reconnectAttempts = 0
-    connect()
+    disconnectAll()
+    connectAll()
     sendResponse({ ok: true })
     return true
   }

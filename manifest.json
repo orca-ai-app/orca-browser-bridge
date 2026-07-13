@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Orca Browser Bridge",
-  "version": "3.0.0",
+  "version": "3.1.1",
   "description": "Connects Chrome to Orca with contextual intelligence overlay, CRM data, and semantic memory capture",
   "permissions": [
     "activeTab",
@@ -20,20 +20,33 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["<all_urls>"],
-      "js": ["overlay/overlay.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "overlay/overlay.js"
+      ],
       "run_at": "document_idle"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["overlay/overlay.css", "icons/*"],
-      "matches": ["<all_urls>"]
+      "resources": [
+        "overlay/overlay.css",
+        "icons/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ],
   "action": {
