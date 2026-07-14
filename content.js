@@ -608,42 +608,50 @@
     return diag
   }
 
+  // Thread ids look like 2-<base64>== in the URL (/messaging/thread/2-XXX==/).
+  // LinkedIn doesn't expose them as hrefs on the list items, so pull the id out
+  // of the item's markup (data attributes / nested urns) by pattern.
+  function extractUrnFromItem(item) {
+    // An anchor href, if any build has one.
+    const a = item.querySelector('a[href*="/messaging/thread/"]')
+    const fromHref = extractThreadUrn(a?.getAttribute('href'))
+    if (fromHref) return fromHref
+    // Otherwise scan the item's HTML for the thread-id pattern (appears in
+    // data-view-name / entity urns / tracking attributes).
+    const m = item.outerHTML.match(/2-[A-Za-z0-9+/=_-]{16,}={0,2}/)
+    return m ? m[0] : null
+  }
+
   async function linkedinListConversations(limit, unreadOnly) {
     if (!location.pathname.startsWith('/messaging')) {
       return { error: 'Not on the messaging page', url: location.href }
     }
     const maxItems = Math.min(limit || 25, 100)
 
-    // Anchor-first strategy: the thread link href is the single most stable
-    // hook (it carries the conversation id). Wait for at least one, then work
-    // outward to its list item. This sidesteps LinkedIn's volatile item/card
-    // class names entirely.
-    const anchor = await waitForElement(['a[href*="/messaging/thread/"]'], 12000)
-    if (!anchor) {
+    const ITEM_SELECTOR = 'li.msg-conversation-listitem, [class*="conversation-listitem"]'
+    const first = await waitForElement([ITEM_SELECTOR], 12000)
+    if (!first) {
       return {
-        error: 'LinkedIn conversation list not found (no thread links rendered)',
+        error: 'LinkedIn conversation list not found (no list items rendered)',
         diagnostics: linkedinMessagingDiagnostics(),
       }
     }
 
-    const links = Array.from(document.querySelectorAll('a[href*="/messaging/thread/"]'))
+    const items = Array.from(document.querySelectorAll(ITEM_SELECTOR))
     const conversations = []
     const seenUrns = new Set()
 
-    for (const link of links) {
+    for (const item of items) {
       if (conversations.length >= maxItems) break
-      const urn = extractThreadUrn(link.getAttribute('href'))
+      const urn = extractUrnFromItem(item)
       if (!urn || seenUrns.has(urn)) continue
-
-      // The list item is the nearest <li>, else the link's card ancestor.
-      const item = link.closest('li') || link.closest('[class*="conversation"]') || link
 
       const name = findWithin(item, [
         '.msg-conversation-listitem__participant-names',
         '.msg-conversation-card__participant-names',
         '[class*="participant-names"]',
         'h3',
-      ])?.textContent?.trim() || link.getAttribute('aria-label')?.trim() || ''
+      ])?.textContent?.trim() || ''
 
       const snippet = findWithin(item, [
         '.msg-conversation-card__message-snippet',
@@ -669,7 +677,19 @@
       })
     }
 
-    return { count: conversations.length, total_items: links.length, conversations }
+    // Items exist but no ids could be extracted — return the first item's HTML
+    // so the id-extraction can be fixed exactly, not guessed.
+    if (conversations.length === 0 && items.length > 0) {
+      return {
+        error: `${items.length} list items found but no conversation ids extracted`,
+        diagnostics: {
+          itemCount: items.length,
+          firstItemHtml: items[0].outerHTML.slice(0, 2500),
+        },
+      }
+    }
+
+    return { count: conversations.length, total_items: items.length, conversations }
   }
 
   async function linkedinOpenThread(conversationUrn) {
@@ -678,12 +698,13 @@
         location.pathname.includes(conversationUrn)) {
       return true
     }
-    // SPA-click the matching thread anchor by href (the stable hook) — never
-    // navigate the tab (keeps history clean, no full reload in the background).
-    const anchors = document.querySelectorAll('a[href*="/messaging/thread/"]')
-    for (const link of anchors) {
-      if (extractThreadUrn(link.getAttribute('href')) === conversationUrn) {
-        link.click()
+    // SPA-open by clicking the list item whose markup carries this thread id
+    // (no anchors exist on this LinkedIn build). Never navigate the tab.
+    const items = document.querySelectorAll('li.msg-conversation-listitem, [class*="conversation-listitem"]')
+    for (const item of items) {
+      if (extractUrnFromItem(item) === conversationUrn) {
+        const target = item.querySelector('[role="link"], .msg-conversation-card__content--selectable, a') || item
+        target.click()
         await jitter(1200, 2200)
         return true
       }
