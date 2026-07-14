@@ -608,18 +608,33 @@
     return diag
   }
 
-  // Thread ids look like 2-<base64>== in the URL (/messaging/thread/2-XXX==/).
-  // LinkedIn doesn't expose them as hrefs on the list items, so pull the id out
-  // of the item's markup (data attributes / nested urns) by pattern.
-  function extractUrnFromItem(item) {
-    // An anchor href, if any build has one.
-    const a = item.querySelector('a[href*="/messaging/thread/"]')
-    const fromHref = extractThreadUrn(a?.getAttribute('href'))
-    if (fromHref) return fromHref
-    // Otherwise scan the item's HTML for the thread-id pattern (appears in
-    // data-view-name / entity urns / tracking attributes).
-    const m = item.outerHTML.match(/2-[A-Za-z0-9+/=_-]{16,}={0,2}/)
-    return m ? m[0] : null
+  const LI_ITEM_SELECTOR = 'li.msg-conversation-listitem, [class*="conversation-listitem"]'
+
+  // This LinkedIn build exposes NO thread id on the list items (only Ember view
+  // ids) — the real 2-<base64>== id only appears in the URL after a conversation
+  // is opened. So conversations are identified by participant name; the real
+  // thread id is captured from the URL at read time and kept in source_data.
+  function itemDisplayName(item) {
+    const h3 = findWithin(item, [
+      '.msg-conversation-listitem__participant-names',
+      '.msg-conversation-card__participant-names',
+      '[class*="participant-names"]',
+      'h3',
+    ])
+    const fromH3 = h3?.textContent?.trim()
+    if (fromH3) return fromH3
+    const img = item.querySelector('img[alt]')
+    return img?.getAttribute('alt')?.trim() || ''
+  }
+
+  function slugName(name) {
+    return (name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
+  }
+
+  function itemClickTarget(item) {
+    return item.querySelector(
+      '.msg-conversation-card__content--selectable, .msg-conversation-listitem__link, [role="link"], a'
+    ) || item
   }
 
   async function linkedinListConversations(limit, unreadOnly) {
@@ -628,8 +643,7 @@
     }
     const maxItems = Math.min(limit || 25, 100)
 
-    const ITEM_SELECTOR = 'li.msg-conversation-listitem, [class*="conversation-listitem"]'
-    const first = await waitForElement([ITEM_SELECTOR], 12000)
+    const first = await waitForElement([LI_ITEM_SELECTOR], 12000)
     if (!first) {
       return {
         error: 'LinkedIn conversation list not found (no list items rendered)',
@@ -637,27 +651,27 @@
       }
     }
 
-    const items = Array.from(document.querySelectorAll(ITEM_SELECTOR))
+    const ownFirst = (linkedinOwnName() || '').trim().split(/\s+/)[0].toLowerCase()
+    const items = Array.from(document.querySelectorAll(LI_ITEM_SELECTOR))
     const conversations = []
-    const seenUrns = new Set()
+    const seenSlugs = new Set()
 
     for (const item of items) {
       if (conversations.length >= maxItems) break
-      const urn = extractUrnFromItem(item)
-      if (!urn || seenUrns.has(urn)) continue
-
-      const name = findWithin(item, [
-        '.msg-conversation-listitem__participant-names',
-        '.msg-conversation-card__participant-names',
-        '[class*="participant-names"]',
-        'h3',
-      ])?.textContent?.trim() || ''
+      const name = itemDisplayName(item)
+      const slug = slugName(name)
+      if (!slug || seenSlugs.has(slug)) continue
 
       const snippet = findWithin(item, [
         '.msg-conversation-card__message-snippet',
         '[class*="message-snippet"]',
         'p',
       ])?.textContent?.trim() || ''
+
+      // The snippet is prefixed with the last sender ("You: ..." / "Jay: ...").
+      // If the last message is Chris's, the conversation is already handled.
+      const lastFromMe = /^\s*you\s*:/i.test(snippet) ||
+        (!!ownFirst && new RegExp('^\\s*' + ownFirst + '\\s*:', 'i').test(snippet))
 
       const timeEl = findWithin(item, ['time'])
       const unread =
@@ -666,26 +680,22 @@
 
       if (unreadOnly && !unread) continue
 
-      seenUrns.add(urn)
+      seenSlugs.add(slug)
       conversations.push({
-        conversation_urn: urn,
+        conversation_urn: slug,
         sender_name: name,
         snippet: snippet.slice(0, 300),
+        last_from_me: lastFromMe,
         time_text: timeEl?.textContent?.trim() || '',
         time_attr: timeEl?.getAttribute('datetime') || null,
         unread,
       })
     }
 
-    // Items exist but no ids could be extracted — return the first item's HTML
-    // so the id-extraction can be fixed exactly, not guessed.
     if (conversations.length === 0 && items.length > 0) {
       return {
-        error: `${items.length} list items found but no conversation ids extracted`,
-        diagnostics: {
-          itemCount: items.length,
-          firstItemHtml: items[0].outerHTML.slice(0, 2500),
-        },
+        error: `${items.length} list items found but no participant names extracted`,
+        diagnostics: { itemCount: items.length, firstItemHtml: items[0].outerHTML.slice(0, 2500) },
       }
     }
 
@@ -693,18 +703,12 @@
   }
 
   async function linkedinOpenThread(conversationUrn) {
-    // Already open?
-    if (location.pathname.includes(encodeURIComponent(conversationUrn)) ||
-        location.pathname.includes(conversationUrn)) {
-      return true
-    }
-    // SPA-open by clicking the list item whose markup carries this thread id
-    // (no anchors exist on this LinkedIn build). Never navigate the tab.
-    const items = document.querySelectorAll('li.msg-conversation-listitem, [class*="conversation-listitem"]')
+    // SPA-open by clicking the list item whose participant name matches the
+    // slug (no thread id exists on the items). Never navigate the tab.
+    const items = document.querySelectorAll(LI_ITEM_SELECTOR)
     for (const item of items) {
-      if (extractUrnFromItem(item) === conversationUrn) {
-        const target = item.querySelector('[role="link"], .msg-conversation-card__content--selectable, a') || item
-        target.click()
+      if (slugName(itemDisplayName(item)) === conversationUrn) {
+        itemClickTarget(item).click()
         await jitter(1200, 2200)
         return true
       }
@@ -756,8 +760,14 @@
       '.msg-thread a[href*="/in/"], .msg-title-bar a[href*="/in/"], .msg-entity-lockup a[href*="/in/"]'
     )
 
+    // Now that the thread is open, the URL carries LinkedIn's real thread id —
+    // capture it for the record (kept in source_data; the send path opens by
+    // participant name, so this is reference only).
+    const capturedThreadId = extractThreadUrn(location.pathname)
+
     return {
       conversation_urn: conversationUrn,
+      captured_thread_id: capturedThreadId,
       own_name: ownName,
       sender_profile_url: profileLink?.href || null,
       messageCount: messages.length,
