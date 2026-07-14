@@ -678,13 +678,11 @@
         location.pathname.includes(conversationUrn)) {
       return true
     }
-    // SPA-click the matching list item — never navigate the tab (keeps history clean
-    // and avoids a full reload in the background tab)
-    const items = document.querySelectorAll(LI_CONVO_ITEM_SELECTORS.join(', '))
-    for (const item of items) {
-      const link = findWithin(item, LI_CONVO_LINK_SELECTORS)
-      const urn = extractThreadUrn(link?.getAttribute('href'))
-      if (urn === conversationUrn && link) {
+    // SPA-click the matching thread anchor by href (the stable hook) — never
+    // navigate the tab (keeps history clean, no full reload in the background).
+    const anchors = document.querySelectorAll('a[href*="/messaging/thread/"]')
+    for (const link of anchors) {
+      if (extractThreadUrn(link.getAttribute('href')) === conversationUrn) {
         link.click()
         await jitter(1200, 2200)
         return true
