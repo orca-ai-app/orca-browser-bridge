@@ -777,6 +777,24 @@
     }
   }
 
+  // Structural report for the compose area, used when send fails, so the real
+  // DOM shape is surfaced instead of guessing selectors.
+  function linkedinComposeDiagnostics() {
+    const form = document.querySelector('form.msg-form, .msg-form')
+    const btns = []
+    if (form) {
+      form.querySelectorAll('button').forEach((b) => {
+        if (btns.length < 8) btns.push({ text: (b.textContent || '').trim().slice(0, 30), class: b.className.slice(0, 120), disabled: b.disabled })
+      })
+    }
+    return {
+      contentEditableCount: document.querySelectorAll('[contenteditable="true"]').length,
+      msgFormPresent: !!form,
+      buttons: btns,
+      formHtml: form ? form.outerHTML.slice(0, 2000) : null,
+    }
+  }
+
   async function linkedinSendDm(conversationUrn, textBase64) {
     if (!conversationUrn) return { error: 'conversationUrn is required' }
     let text = ''
@@ -787,27 +805,46 @@
     if (!opened) return { error: `Conversation not found in list: ${conversationUrn}` }
 
     const compose = await waitForElement(LI_COMPOSE_SELECTORS, 8000)
-    if (!compose) return { error: 'Could not find message compose box (DOM change?)' }
+    if (!compose) {
+      return { success: false, error: 'Could not find message compose box', diagnostics: linkedinComposeDiagnostics() }
+    }
 
     // Human-shaped step jitter. The LARGE pre-send delay (5-45s) lives in the
     // desktop job before this command is issued — the bridge's 30s command
     // timeout means everything in here must stay well under that.
     compose.focus()
     await jitter(400, 1200)
-    compose.innerHTML = ''
+    // Clear any existing content the way the editor expects.
+    document.execCommand('selectAll', false, null)
+    document.execCommand('delete', false, null)
     await jitter(150, 400)
     document.execCommand('insertText', false, text)
     compose.dispatchEvent(new Event('input', { bubbles: true }))
     compose.dispatchEvent(new Event('change', { bubbles: true }))
     await jitter(600, 1800)
 
+    const typed = (compose.innerText || compose.textContent || '').trim()
+    if (!typed) {
+      return { success: false, error: 'Text did not register in the compose box', diagnostics: linkedinComposeDiagnostics() }
+    }
+
     const sendBtn = await waitForClickable(LI_SEND_BTN_SELECTORS, 4000)
     if (!sendBtn) {
-      return { success: false, action: 'message_typed', error: 'Message typed but send button not found' }
+      return { success: false, action: 'message_typed', error: 'Message typed but send button not found', diagnostics: linkedinComposeDiagnostics() }
+    }
+    if (sendBtn.disabled) {
+      return { success: false, action: 'message_typed', error: 'Send button is disabled (text may not have registered with the editor)', diagnostics: linkedinComposeDiagnostics() }
     }
     await jitter(300, 900)
     sendBtn.click()
-    await jitter(500, 1000)
+    await jitter(900, 1500)
+
+    // Verify: LinkedIn clears the compose box after a successful send. If our
+    // text is still there, the click did not send.
+    const still = (compose.innerText || compose.textContent || '').trim()
+    if (still && still.includes(text.slice(0, 20))) {
+      return { success: false, action: 'send_clicked_but_not_sent', error: 'Clicked send but the message is still in the box', diagnostics: linkedinComposeDiagnostics() }
+    }
 
     return { success: true, action: 'message_sent', conversation_urn: conversationUrn }
   }

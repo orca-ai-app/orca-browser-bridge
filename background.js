@@ -191,7 +191,7 @@ async function handleCommand(request) {
   try {
     switch (command) {
       case 'ping':
-        return success(id, { status: 'ok', version: '4.1.6' })
+        return success(id, { status: 'ok', version: '4.1.7' })
 
       case 'list_tabs':
         return await cmdListTabs(id)
