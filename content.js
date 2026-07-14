@@ -742,7 +742,9 @@
       if (nameEl) currentSender = nameEl.textContent?.trim() || currentSender
 
       const bodyEl = ev.querySelector('.msg-s-event-listitem__body, [class*="event-listitem__body"]')
-      const text = bodyEl?.textContent?.trim()
+      // innerText preserves line breaks between paragraphs/sentences; textContent
+      // runs them together ("for it.Good to be connected").
+      const text = (bodyEl?.innerText || bodyEl?.textContent || '').trim()
       if (!text) continue
 
       const timeEl = ev.querySelector('time')
