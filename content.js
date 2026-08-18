@@ -70,6 +70,27 @@
         linkedinSendDm(msg.conversationUrn, msg.textBase64).then(sendResponse)
         return true
 
+      // WhatsApp Web actions
+      case 'orca-whatsapp-list-chats':
+        sendResponse(whatsappListChats(msg.limit))
+        return true
+
+      case 'orca-whatsapp-open-chat':
+        handleWhatsAppOpenChat(msg.recipient).then(sendResponse)
+        return true
+
+      case 'orca-whatsapp-send-message':
+        handleWhatsAppSendMessage(msg.recipient, msg.messageBase64).then(sendResponse)
+        return true
+
+      case 'orca-whatsapp-read-messages':
+        sendResponse(whatsappReadMessages(msg.limit))
+        return true
+
+      case 'orca-whatsapp-check-unread':
+        sendResponse(whatsappCheckUnread())
+        return true
+
       default:
         // Don't respond to overlay messages (handled by overlay.js)
         if (action?.startsWith('orca_')) return false
@@ -103,7 +124,53 @@
       const t = (el.innerText || '').trim()
       if (t.length > best.length) best = t
     })
-    return best.substring(0, 1500)
+    if (best.trim()) return best.substring(0, 1500)
+    return harvestBodyFromLines(root.innerText || '')
+  }
+
+  // Last-resort body extraction, and the one that actually holds up.
+  //
+  // LinkedIn's search feed is now server-driven with per-build hashed class
+  // names (`adfab463`, `_10fbd90b`), so every class selector above is one
+  // deploy away from returning nothing — which is exactly what happened, and
+  // an empty body means the app skips the post as too short. This derives the
+  // body from the post's own visible text instead: drop the author header,
+  // which ends at the timestamp or the Follow control, and stop at the
+  // engagement footer.
+  const HARVEST_HEADER_END = /^(Follow|Following|Connect|\+ Follow)$/i
+  const HARVEST_TIMESTAMP = /^(now|\d+\s*(s|m|h|d|w|mo|y|yr))\s*(•|·)/i
+  const HARVEST_FOOTER = /^(Like|Comment|Repost|Send|Reply|Share)$/i
+  const HARVEST_NOISE = /^(…\s*)?(see\s+)?more$|^Feed post$/i
+
+  function harvestBodyFromLines(text) {
+    const lines = text.split(String.fromCharCode(10)).map((l) => l.trim())
+
+    // Header ends at the LAST header marker in the opening block: the name,
+    // headline and timestamp all precede the body.
+    let start = 0
+    const scan = Math.min(lines.length, 18)
+    for (let i = 0; i < scan; i++) {
+      if (HARVEST_HEADER_END.test(lines[i]) || HARVEST_TIMESTAMP.test(lines[i])) start = i + 1
+    }
+
+    let end = lines.length
+    for (let i = start; i < lines.length; i++) {
+      if (HARVEST_FOOTER.test(lines[i])) {
+        end = i
+        break
+      }
+    }
+
+    const body = lines
+      .slice(start, end)
+      .filter((l) => l && !HARVEST_NOISE.test(l))
+      .join(String.fromCharCode(10))
+      .trim()
+
+    // If the header/footer heuristic ate everything, the raw text beats
+    // nothing: the app only needs enough to draft against.
+    if (body.length < 30) return text.trim().substring(0, 1500)
+    return body.substring(0, 1500)
   }
 
   // Scroll to load lazy posts, then extract per-post metadata from the
@@ -129,7 +196,11 @@
         // fall back to the legacy walk-up (first ancestor with enough text).
         // The walk-up alone stops at a long author-header block and misses the
         // body, which produced the "[Draft generation failed]" cards.
-        let root = btn.closest('.feed-shared-update-v2, [data-urn]')
+        // `[componentkey]` is the server-driven feed's post container; the two
+        // legacy classes stopped matching entirely when LinkedIn moved the
+        // search feed to SDUI, which dropped every post back to the walk-up.
+        let root = btn.closest('.feed-shared-update-v2, [data-urn], [componentkey]')
+        if (root && (root.innerText || '').length < 150) root = null
         if (!root) {
           root = btn.parentElement
           while (
@@ -159,6 +230,34 @@
     }
   }
 
+  function harvestToastLinks() {
+    const out = []
+    document
+      .querySelectorAll('[class*="toast"], [role="alert"], [role="status"]')
+      .forEach((t) => {
+        t.querySelectorAll('a').forEach((a) => {
+          if (a.href) out.push(a.href)
+        })
+      })
+    return out
+  }
+
+  // The toast's "View post" link is now a /safety/go/ interstitial carrying the
+  // real destination in ?url=. The old code did href.split('?')[0], which threw
+  // that away and handed back the bare interstitial for every single post.
+  function harvestUnwrapSafetyUrl(href) {
+    try {
+      const u = new URL(href)
+      if (u.pathname.indexOf('/safety/go') === 0) {
+        const inner = u.searchParams.get('url')
+        if (inner) return inner
+      }
+      return href.split('?')[0]
+    } catch (e) {
+      return href.split('?')[0]
+    }
+  }
+
   // Resolve a post's canonical URL: open its control menu, click "Copy link",
   // read the toast's "View post" link. Returns { url } or { error }.
   async function harvestResolveUrl(menuLabel) {
@@ -170,36 +269,39 @@
       ).find((b) => b.getAttribute('aria-label') === menuLabel)
       if (!btn) return { error: 'menu button not found' }
 
-      btn.click()
-      await harvestSleep(1500)
+      // Toasts stack and persist between posts, so a link that is already on
+      // screen belongs to a PREVIOUS post. Snapshot them and only accept a new
+      // one, or posts silently get each other's URLs.
+      const before = harvestToastLinks()
 
-      const items = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], li'))
-      const copyLink = items.find(
-        (el) => el.innerText && el.innerText.toLowerCase().includes('copy link')
-      )
+      btn.click()
+
+      // Poll rather than sleep: the control menu takes longer than the old
+      // fixed 1500ms to render, so the lookup ran against the page's global
+      // nav and returned "copy link not found" every time.
+      let copyLink = null
+      for (let i = 0; i < 20 && !copyLink; i++) {
+        await harvestSleep(250)
+        copyLink = Array.from(
+          document.querySelectorAll('[role="menuitem"], [role="option"], li')
+        ).find((el) => el.innerText && el.innerText.toLowerCase().includes('copy link'))
+      }
       if (!copyLink) {
         document.body.click()
         return { error: 'copy link not found' }
       }
       copyLink.click()
-      await harvestSleep(1500)
 
-      let url = null
-      const toasts = document.querySelectorAll('[class*="toast"], [role="alert"]')
-      for (const toast of toasts) {
-        for (const link of toast.querySelectorAll('a')) {
-          if (link.innerText.includes('View post')) {
-            url = link.href.split('?')[0]
-            break
-          }
-        }
-        if (url) break
+      let href = null
+      for (let i = 0; i < 20 && !href; i++) {
+        await harvestSleep(250)
+        href = harvestToastLinks().find((h) => before.indexOf(h) === -1) || null
       }
 
       document.body.click()
       await harvestSleep(300)
 
-      return url ? { url } : { error: 'no toast link found' }
+      return href ? { url: harvestUnwrapSafetyUrl(href) } : { error: 'no toast link found' }
     } catch (e) {
       return { error: e.message }
     }
@@ -957,6 +1059,274 @@
   // ============================================================
   // Page-world bridge (allows chrome-control / osascript to
   // trigger extension actions via window.postMessage)
+  // ============================================================
+  // WhatsApp Web handlers
+  // ============================================================
+
+  function whatsappListChats(limit) {
+    const maxItems = Math.min(limit || 30, 100)
+    const chatGrid = document.querySelector('div[aria-label="Chat list"]')
+    if (!chatGrid) return { error: 'WhatsApp chat list not found. Is WhatsApp Web open?' }
+
+    const rows = chatGrid.querySelectorAll('[role="row"]')
+    const chats = []
+
+    for (let i = 0; i < Math.min(rows.length, maxItems); i++) {
+      const row = rows[i]
+      const nameSpan = row.querySelector('span[title]')
+      if (!nameSpan) continue
+
+      const name = nameSpan.getAttribute('title')
+
+      // Last message preview: second span[title] or the last text snippet
+      const allTitled = row.querySelectorAll('span[title]')
+      let lastMessage = ''
+      if (allTitled.length > 1) {
+        lastMessage = allTitled[allTitled.length - 1].getAttribute('title') || ''
+      }
+
+      // Timestamp
+      const timeEl = row.querySelector('div[class*="chat"] > div > div:last-child') ||
+                     row.querySelector('[data-pre-plain-text]')
+      let timestamp = ''
+      // Look for small text that's typically the time
+      const smallTexts = row.querySelectorAll('div')
+      for (const div of smallTexts) {
+        const t = div.textContent?.trim()
+        if (t && /^\d{1,2}:\d{2}/.test(t) || /^Yesterday/.test(t) || /^\d{1,2}\/\d{1,2}\/\d{4}/.test(t) || /^Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday/.test(t)) {
+          timestamp = t
+          break
+        }
+      }
+
+      // Unread badge
+      const badge = row.querySelector('span[aria-label*="unread"]')
+      const unread = badge ? parseInt(badge.textContent) || 1 : 0
+
+      // Muted indicator
+      const muted = !!row.querySelector('div[aria-label="Muted chat"]')
+
+      chats.push({ name, lastMessage: lastMessage.slice(0, 200), timestamp, unread, muted })
+    }
+
+    return { count: chats.length, chats }
+  }
+
+  async function handleWhatsAppOpenChat(recipient) {
+    if (!recipient) return { error: 'recipient is required' }
+
+    // Find and clear the search box
+    const searchInput = document.querySelector('input[aria-label="Search or start a new chat"]')
+    if (!searchInput) return { error: 'WhatsApp search box not found' }
+
+    searchInput.focus()
+    await wait(300)
+
+    // Clear existing search
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+    if (nativeSetter) {
+      nativeSetter.call(searchInput, '')
+    } else {
+      searchInput.value = ''
+    }
+    searchInput.dispatchEvent(new Event('input', { bubbles: true }))
+    await wait(300)
+
+    // Type the recipient name
+    if (nativeSetter) {
+      nativeSetter.call(searchInput, recipient)
+    } else {
+      searchInput.value = recipient
+    }
+    searchInput.dispatchEvent(new Event('input', { bubbles: true }))
+    await wait(1500) // Wait for search results
+
+    // Find matching result in the chat list
+    const rows = document.querySelectorAll('[role="listitem"], [role="row"]')
+    let matched = null
+    const recipientLower = recipient.toLowerCase()
+
+    for (const row of rows) {
+      const nameSpan = row.querySelector('span[title]')
+      if (nameSpan) {
+        const name = nameSpan.getAttribute('title')?.toLowerCase() || ''
+        if (name.includes(recipientLower) || recipientLower.includes(name)) {
+          matched = row
+          break
+        }
+      }
+    }
+
+    if (!matched) {
+      // Clear search
+      const clearBtn = document.querySelector('button[aria-label="Cancel search"]') ||
+                       document.querySelector('button[aria-label="Back"]')
+      if (clearBtn) clearBtn.click()
+      return { error: `No chat found for "${recipient}"` }
+    }
+
+    matched.click()
+    await wait(1000)
+
+    // Verify conversation opened by checking for compose box
+    const compose = await waitForElement([
+      'div[contenteditable="true"][role="textbox"]',
+      'footer div[contenteditable="true"]',
+      'div[title="Type a message"]',
+    ], 3000)
+
+    // Clear search after opening
+    const clearBtn = document.querySelector('button[aria-label="Cancel search"]') ||
+                     document.querySelector('button[aria-label="Back"]')
+    if (clearBtn) clearBtn.click()
+
+    return {
+      success: true,
+      opened: !!compose,
+      recipient: matched.querySelector('span[title]')?.getAttribute('title') || recipient,
+    }
+  }
+
+  async function handleWhatsAppSendMessage(recipient, messageBase64) {
+    let message = ''
+    if (messageBase64) {
+      message = decodeURIComponent(escape(atob(messageBase64)))
+    }
+    if (!message) return { error: 'No message text provided' }
+
+    // If recipient specified, open that chat first
+    if (recipient) {
+      const openResult = await handleWhatsAppOpenChat(recipient)
+      if (openResult.error) return openResult
+      await wait(500)
+    }
+
+    // Find the compose box
+    const compose = await waitForElement([
+      'div[contenteditable="true"][role="textbox"]',
+      'footer div[contenteditable="true"]',
+      'div[title="Type a message"]',
+    ], 5000)
+
+    if (!compose) return { error: 'Cannot find WhatsApp message input. Is a conversation open?' }
+
+    compose.focus()
+    await wait(300)
+
+    // Clear and type the message
+    compose.innerHTML = ''
+    await wait(100)
+
+    // Use insertText for React/WhatsApp compatibility
+    document.execCommand('insertText', false, message)
+    compose.dispatchEvent(new Event('input', { bubbles: true }))
+    await wait(500)
+
+    // Find and click send button
+    const sendBtn = await waitForClickable([
+      'button[aria-label="Send"]',
+      'span[data-icon="send"]',
+    ], 3000)
+
+    if (sendBtn) {
+      // If we matched the icon rather than the button, click parent button
+      const btn = sendBtn.closest('button') || sendBtn
+      btn.click()
+      await wait(500)
+      return { success: true, action: 'message_sent', recipient: recipient || 'current chat' }
+    }
+
+    return { success: false, action: 'message_typed', message: 'Message typed but send button not found. It may need manual send.' }
+  }
+
+  function whatsappReadMessages(limit) {
+    const maxItems = Math.min(limit || 50, 200)
+
+    // Check we're in a conversation
+    const header = document.querySelector('header')
+    let conversationName = ''
+    if (header) {
+      const nameSpan = header.querySelector('span[title]')
+      if (nameSpan) conversationName = nameSpan.getAttribute('title') || ''
+    }
+
+    // Find message containers
+    const msgIn = document.querySelectorAll('.message-in, [class*="message-in"]')
+    const msgOut = document.querySelectorAll('.message-out, [class*="message-out"]')
+
+    // If no class-based messages found, try role-based
+    let allMessages = []
+
+    if (msgIn.length > 0 || msgOut.length > 0) {
+      // Collect all messages with direction
+      const all = document.querySelectorAll('.message-in, .message-out, [class*="message-in"], [class*="message-out"]')
+      for (let i = Math.max(0, all.length - maxItems); i < all.length; i++) {
+        const el = all[i]
+        const isIncoming = el.classList.contains('message-in') || el.className.includes('message-in')
+        const textEl = el.querySelector('[class*="selectable-text"]') || el.querySelector('span[dir="ltr"]')
+        const text = textEl?.textContent?.trim() || ''
+        if (!text) continue
+
+        // Timestamp
+        const timeEl = el.querySelector('[data-pre-plain-text]')
+        const timestamp = timeEl?.getAttribute('data-pre-plain-text')?.trim() || ''
+
+        allMessages.push({
+          direction: isIncoming ? 'incoming' : 'outgoing',
+          text: text.slice(0, 1000),
+          timestamp,
+        })
+      }
+    } else {
+      // Fallback: try to get messages from rows
+      const rows = document.querySelectorAll('[role="row"]')
+      for (let i = Math.max(0, rows.length - maxItems); i < rows.length; i++) {
+        const row = rows[i]
+        const textSpan = row.querySelector('span[dir="ltr"]')
+        if (textSpan) {
+          allMessages.push({
+            direction: 'unknown',
+            text: textSpan.textContent?.trim().slice(0, 1000) || '',
+            timestamp: '',
+          })
+        }
+      }
+    }
+
+    return {
+      conversation: conversationName,
+      messageCount: allMessages.length,
+      messages: allMessages,
+    }
+  }
+
+  function whatsappCheckUnread() {
+    const chatGrid = document.querySelector('div[aria-label="Chat list"]')
+    if (!chatGrid) return { error: 'WhatsApp chat list not found' }
+
+    const badges = chatGrid.querySelectorAll('span[aria-label*="unread"]')
+    const unreadChats = []
+
+    badges.forEach(badge => {
+      const count = parseInt(badge.textContent) || 1
+      // Walk up to find the chat name
+      const row = badge.closest('[role="row"]')
+      if (row) {
+        const nameSpan = row.querySelector('span[title]')
+        const name = nameSpan?.getAttribute('title') || 'Unknown'
+        unreadChats.push({ name, unread: count })
+      }
+    })
+
+    const totalUnread = unreadChats.reduce((sum, c) => sum + c.unread, 0)
+
+    return {
+      totalUnread,
+      chatCount: unreadChats.length,
+      chats: unreadChats,
+    }
+  }
+
   // ============================================================
 
   window.addEventListener('message', (event) => {

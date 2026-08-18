@@ -191,7 +191,25 @@ async function handleCommand(request) {
   try {
     switch (command) {
       case 'ping':
-        return success(id, { status: 'ok', version: '4.1.7' })
+        // Read the manifest rather than a literal: the hardcoded string had
+        // drifted to 4.1.7 against a 3.x manifest, so a ping could not tell
+        // you whether a reload had actually picked up new code.
+        return success(id, { status: 'ok', version: chrome.runtime.getManifest().version })
+
+      case 'reload':
+        // Restart this extension so it re-reads its files from disk. For an
+        // unpacked extension that is how the desktop app pushes an update: it
+        // stages the new files, then sends this, and the user does nothing.
+        //
+        // The acknowledgement is returned FIRST and the reload runs on a short
+        // timer, so the reply is on the wire before the service worker dies.
+        // Callers should still tolerate no reply arriving at all.
+        //
+        // Safe to do: connectAll() and both chrome.alarms.create calls sit at
+        // the top level of this file, so the socket and the keepalive and
+        // draft-badge alarms all come back on their own after the restart.
+        setTimeout(() => chrome.runtime.reload(), 250)
+        return success(id, { status: 'reloading', version: chrome.runtime.getManifest().version })
 
       case 'list_tabs':
         return await cmdListTabs(id)
@@ -249,6 +267,24 @@ async function handleCommand(request) {
       case 'linkedin_send_message':
         return await cmdLinkedInMessagingAction(id, 'orca-linkedin-send-dm', params, 25000)
 
+      // WhatsApp Web — routes to the content script on an open web.whatsapp.com
+      // tab. Only godmode sends these today; they are inert in any build that
+      // does not, which is why the extension can stay a single artefact.
+      case 'whatsapp_list_chats':
+        return await cmdWhatsAppAction(id, 'orca-whatsapp-list-chats', params)
+
+      case 'whatsapp_open_chat':
+        return await cmdWhatsAppAction(id, 'orca-whatsapp-open-chat', params)
+
+      case 'whatsapp_send_message':
+        return await cmdWhatsAppAction(id, 'orca-whatsapp-send-message', params, 20000)
+
+      case 'whatsapp_read_messages':
+        return await cmdWhatsAppAction(id, 'orca-whatsapp-read-messages', params)
+
+      case 'whatsapp_check_unread':
+        return await cmdWhatsAppAction(id, 'orca-whatsapp-check-unread', params)
+
       default:
         return error(id, `Unknown command: ${command}`)
     }
@@ -285,7 +321,7 @@ async function cmdGetActiveTab(id) {
 }
 
 async function cmdOpenUrl(id, params) {
-  const { url, new_tab } = params || {}
+  const { url, new_tab, background } = params || {}
   if (!url) return error(id, 'url is required')
 
   if (new_tab === false) {
@@ -295,7 +331,9 @@ async function cmdOpenUrl(id, params) {
       return success(id, { tabId: tab.id, url })
     }
   }
-  const tab = await chrome.tabs.create({ url, active: true })
+  // background: true opens without stealing focus (PR listener X reads —
+  // same passive pattern as the pinned LinkedIn messaging tab).
+  const tab = await chrome.tabs.create({ url, active: background !== true })
   return success(id, { tabId: tab.id, url })
 }
 
@@ -417,7 +455,83 @@ async function cmdLinkedinExtractMetas(id, params) {
 
 async function cmdLinkedinResolveUrl(id, params) {
   const tabId = await getTargetTabId(params)
-  const result = await sendToContentScript(tabId, 'orca-resolve-url', { menuLabel: params?.menuLabel }, 15000)
+  // The content script now polls for the menu and the toast (up to ~10s
+  // combined), so the old 15s budget could expire mid-resolve.
+  const result = await sendToContentScript(tabId, 'orca-resolve-url', { menuLabel: params?.menuLabel }, 25000)
+  if (result && result.url) {
+    result.url = await expandLinkedInShortlink(result.url)
+  }
+  return success(id, result)
+}
+
+// "Copy link to post" yields an lnkd.in shortlink, which carries no activity
+// or share id — and the app derives the URN it comments with by regexing
+// `share-NNN` / `activity-NNN` out of the URL. Left unexpanded, every
+// harvested post would draft fine and then fail to post. Follow the redirect
+// to recover the canonical /posts/...-share-NNN-tok/ form.
+async function expandLinkedInShortlink(url) {
+  if (!/^https?:\/\/lnkd\.in\//i.test(url)) return url
+
+  // Cheap path: the worker has host permissions, so no CORS. Cookies are
+  // included because LinkedIn 403s unauthenticated shortlink fetches.
+  try {
+    const res = await fetch(url, { method: 'GET', redirect: 'follow', credentials: 'include' })
+    const finalUrl = (res.url || '').split('?')[0]
+    if (/linkedin\.com\/(posts|feed)\//i.test(finalUrl)) return finalUrl
+  } catch (e) {
+    // fall through to the tab route
+  }
+
+  // Fallback: resolve it the way a browser would. Background tab, never
+  // focused, matching the messaging handlers' etiquette.
+  return await expandViaBackgroundTab(url)
+}
+
+async function expandViaBackgroundTab(url) {
+  let tab = null
+  try {
+    tab = await chrome.tabs.create({ url, active: false })
+    for (let i = 0; i < 24; i++) {
+      await new Promise((r) => setTimeout(r, 250))
+      const t = await chrome.tabs.get(tab.id)
+      const settled = (t.url || '').split('?')[0]
+      if (t.status === 'complete' && /linkedin\.com\/(posts|feed)\//i.test(settled)) {
+        return settled
+      }
+    }
+    const last = await chrome.tabs.get(tab.id)
+    return (last.url || url).split('?')[0]
+  } catch (e) {
+    return url
+  } finally {
+    if (tab && tab.id) {
+      try {
+        await chrome.tabs.remove(tab.id)
+      } catch (e) {
+        /* tab already gone */
+      }
+    }
+  }
+}
+
+// ============================================================
+// WhatsApp Web (routes to content script on WhatsApp tab)
+// ============================================================
+
+async function cmdWhatsAppAction(id, action, params, timeoutMs = 15000) {
+  let tabId
+  if (params?.tab_id) {
+    tabId = params.tab_id
+  } else {
+    const tabs = await chrome.tabs.query({ url: '*://web.whatsapp.com/*' })
+    if (tabs.length > 0) {
+      tabId = tabs[0].id
+    } else {
+      return error(id, 'No WhatsApp Web tab found. Open web.whatsapp.com in Chrome.')
+    }
+  }
+
+  const result = await sendToContentScript(tabId, action, params || {}, timeoutMs)
   return success(id, result)
 }
 
