@@ -448,8 +448,9 @@ async function cmdFillInput(id, params) {
 
 async function cmdLinkedinExtractMetas(id, params) {
   const tabId = await getTargetTabId(params)
-  // Content script scrolls internally then reads the DOM; allow time for both.
-  const result = await sendToContentScript(tabId, 'orca-extract-metas', {}, 20000)
+  // Content script scrolls progressively (up to ~19 s) then reads the DOM.
+  // Kept under Orca's 30 s bridge timeout.
+  const result = await sendToContentScript(tabId, 'orca-extract-metas', {}, 28000)
   return success(id, result)
 }
 
@@ -457,7 +458,12 @@ async function cmdLinkedinResolveUrl(id, params) {
   const tabId = await getTargetTabId(params)
   // The content script now polls for the menu and the toast (up to ~10s
   // combined), so the old 15s budget could expire mid-resolve.
-  const result = await sendToContentScript(tabId, 'orca-resolve-url', { menuLabel: params?.menuLabel }, 25000)
+  const result = await sendToContentScript(
+    tabId,
+    'orca-resolve-url',
+    { menuLabel: params?.menuLabel, menuIndex: params?.menuIndex },
+    25000
+  )
   if (result && result.url) {
     result.url = await expandLinkedInShortlink(result.url)
   }

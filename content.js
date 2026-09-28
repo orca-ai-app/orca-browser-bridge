@@ -53,7 +53,7 @@
         return true
 
       case 'orca-resolve-url':
-        harvestResolveUrl(msg.menuLabel).then(sendResponse)
+        harvestResolveUrl(msg.menuLabel, msg.menuIndex).then(sendResponse)
         return true
 
       // LinkedIn messaging (godmode inbox triage) — runs in a BACKGROUND tab,
@@ -107,10 +107,71 @@
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
+  const HARVEST_MENU_SELECTOR = 'button[aria-label^="Open control menu for post by"]'
+
+  // The post container for a control-menu button: the LARGEST ancestor that
+  // still holds exactly one post's control menu. The old rule took the nearest
+  // `[componentkey]` (or the first ancestor with 150+ characters), which on the
+  // server-driven search feed is the author-header block whenever the headline
+  // is long, so the body was never in scope and the "body" came back as
+  // "Daniel Käfer • 2nd <headline> Visit my website 10h • Follow" (28 Sep).
+  function harvestPostRoot(btn) {
+    let best = null
+    let el = btn.parentElement
+    while (el && el.tagName !== 'BODY' && el.tagName !== 'MAIN' && el.getAttribute('role') !== 'main') {
+      if (el.tagName === 'UL' || el.tagName === 'OL') break
+      if (el.querySelectorAll(HARVEST_MENU_SELECTOR).length > 1) break
+      best = el
+      el = el.parentElement
+    }
+    return best
+  }
+
+  // Click LinkedIn's "…more" / "see more" inside a post so the full body is in
+  // the DOM before it is read. Buttons only: anchors would navigate away.
+  const HARVEST_SEE_MORE = /^(…|\.\.\.)?\s*(see\s+)?more$/i
+  function harvestExpandMore(root) {
+    if (!root) return 0
+    let clicked = 0
+    root.querySelectorAll('button, [role="button"]').forEach((el) => {
+      if (el.tagName === 'A') return
+      const label = (el.getAttribute('aria-label') || '').trim()
+      const text = (el.innerText || el.textContent || '').trim()
+      if (HARVEST_SEE_MORE.test(text) || /see more/i.test(label)) {
+        try {
+          el.click()
+          clicked++
+        } catch (e) {
+          /* ignore */
+        }
+      }
+    })
+    return clicked
+  }
+
+  // Every post-ish URN in the post's markup (activity / share / ugcPost), so
+  // the app can skip posts it has already queued BEFORE the slow copy-link
+  // resolution. Scans the markup rather than named attributes because the
+  // server-driven feed moves them around.
+  function harvestPostUrns(root) {
+    if (!root) return []
+    const html = root.outerHTML || ''
+    const out = []
+    const re = /urn(?::|%3A)li(?::|%3A)(activity|share|ugcPost)(?::|%3A)(\d{15,22})/gi
+    let m
+    while ((m = re.exec(html)) !== null) {
+      const urn = 'urn:li:' + m[1] + ':' + m[2]
+      if (out.indexOf(urn) === -1) out.push(urn)
+      if (out.length >= 10) break
+    }
+    return out
+  }
+
   // Find the post BODY text within a post root, resilient to LinkedIn's
-  // volatile class names. Prefers the dedicated text component; falls back to
-  // the longest break-words block (the body is longer than the author
-  // headline, which also uses break-words). Returns '' if nothing usable.
+  // volatile class names. Prefers the dedicated text component (legacy feed);
+  // otherwise derives it from the post's visible lines. Returns '' when there
+  // is no body, never the header: the app treats '' as unreadable and skips
+  // the post instead of letting the relevance gate judge a headline.
   function harvestExtractBody(root) {
     if (!root) return ''
     const specific = root.querySelector(
@@ -119,36 +180,33 @@
     if (specific && specific.innerText && specific.innerText.trim()) {
       return specific.innerText.trim().substring(0, 1500)
     }
-    let best = ''
-    root.querySelectorAll('.break-words').forEach((el) => {
-      const t = (el.innerText || '').trim()
-      if (t.length > best.length) best = t
-    })
-    if (best.trim()) return best.substring(0, 1500)
     return harvestBodyFromLines(root.innerText || '')
   }
 
-  // Last-resort body extraction, and the one that actually holds up.
+  // Body from the post's own visible text: drop the author header, which ends
+  // at the timestamp or the Follow control, and stop at the engagement footer.
   //
-  // LinkedIn's search feed is now server-driven with per-build hashed class
-  // names (`adfab463`, `_10fbd90b`), so every class selector above is one
-  // deploy away from returning nothing — which is exactly what happened, and
-  // an empty body means the app skips the post as too short. This derives the
-  // body from the post's own visible text instead: drop the author header,
-  // which ends at the timestamp or the Follow control, and stop at the
-  // engagement footer.
+  // LinkedIn's search feed is server-driven with per-build hashed class names
+  // (`adfab463`, `_10fbd90b`), so class selectors are one deploy away from
+  // returning nothing. Text shape is steadier.
   const HARVEST_HEADER_END = /^(Follow|Following|Connect|\+ Follow)$/i
   const HARVEST_TIMESTAMP = /^(now|\d+\s*(s|m|h|d|w|mo|y|yr))\s*(•|·)/i
   const HARVEST_FOOTER = /^(Like|Comment|Repost|Send|Reply|Share)$/i
-  const HARVEST_NOISE = /^(…\s*)?(see\s+)?more$|^Feed post$/i
+  const HARVEST_COUNTS = /^[\d,.]+[km]?(\s+(comments?|reposts?|reactions?|likes?))?$/i
+  const HARVEST_NOISE = /^(…|\.\.\.)?\s*(see\s+)?more$|^Feed post$|^Visit my website$|^•?\s*(1st|2nd|3rd\+?)$/i
 
   function harvestBodyFromLines(text) {
-    const lines = text.split(String.fromCharCode(10)).map((l) => l.trim())
+    // Blank lines are dropped first: the header alone is a dozen lines once
+    // they are counted, which pushed the Follow marker out of the scan window.
+    const lines = text
+      .split(String.fromCharCode(10))
+      .map((l) => l.trim())
+      .filter((l) => l)
 
     // Header ends at the LAST header marker in the opening block: the name,
-    // headline and timestamp all precede the body.
+    // badge, headline, website link and timestamp all precede the body.
     let start = 0
-    const scan = Math.min(lines.length, 18)
+    const scan = Math.min(lines.length, 14)
     for (let i = 0; i < scan; i++) {
       if (HARVEST_HEADER_END.test(lines[i]) || HARVEST_TIMESTAMP.test(lines[i])) start = i + 1
     }
@@ -160,74 +218,101 @@
         break
       }
     }
+    // Reaction and comment counts sit just above the footer.
+    while (end > start && HARVEST_COUNTS.test(lines[end - 1])) end--
 
     const body = lines
       .slice(start, end)
-      .filter((l) => l && !HARVEST_NOISE.test(l))
+      .filter((l) => !HARVEST_NOISE.test(l))
       .join(String.fromCharCode(10))
       .trim()
 
-    // If the header/footer heuristic ate everything, the raw text beats
-    // nothing: the app only needs enough to draft against.
-    if (body.length < 30) return text.trim().substring(0, 1500)
-    return body.substring(0, 1500)
+    return body.length < 30 ? '' : body.substring(0, 1500)
   }
 
-  // Scroll to load lazy posts, then extract per-post metadata from the
-  // control-menu buttons. Returns
-  // { posts: [{author_hint, context, body, menu_label, degree}] }.
-  // `context` keeps the old author+header chrome (used for the degree badge and
-  // back-compat); `body` is the actual post text the draft model should use.
+  function harvestDegree(context) {
+    if (/·\s*1st/.test(context) || /•\s*1st/.test(context) || (context.indexOf(' 1st') > -1 && context.indexOf('1st connections') === -1)) return '1st'
+    if (/[·•]\s*2nd/.test(context) || context.indexOf(' 2nd') > -1) return '2nd'
+    if (/[·•]\s*3rd/.test(context) || context.indexOf(' 3rd') > -1) return '3rd+'
+    return 'none'
+  }
+
+  function harvestMeta(btn) {
+    const label = btn.getAttribute('aria-label') || ''
+    const m = label.match(/Open control menu for post by (.+)/)
+    const authorName = m ? m[1].trim() : 'Unknown'
+    const root = harvestPostRoot(btn)
+    const context = root ? (root.innerText || '').substring(0, 1500) : ''
+    const sameLabel = Array.from(document.querySelectorAll(HARVEST_MENU_SELECTOR)).filter(
+      (b) => b.getAttribute('aria-label') === label
+    )
+    return {
+      author_hint: authorName,
+      context,
+      body: harvestExtractBody(root),
+      menu_label: label,
+      menu_index: Math.max(0, sameLabel.indexOf(btn)),
+      urns: harvestPostUrns(root),
+      degree: harvestDegree(context),
+    }
+  }
+
+  // Scroll progressively, expanding and reading posts as they load, until
+  // HARVEST_TARGET posts are collected, two rounds in a row add nothing, or
+  // the time budget is spent. Posts are read round by round so a feed that
+  // unloads posts scrolled far out of view still keeps what it showed.
+  // Returns { posts: [{author_hint, context, body, menu_label, menu_index, urns, degree}], scrolls }.
+  // The background worker allows 28 s for this call (and Orca's bridge 30 s),
+  // so the budget below must stay well inside that.
+  const HARVEST_TARGET = 25
+  const HARVEST_MAX_SCROLLS = 8
+  const HARVEST_BUDGET_MS = 19000
+
   async function harvestExtractMetas() {
     try {
-      window.scrollBy(0, 2000)
-      await harvestSleep(3000)
-
-      const menuBtns = Array.from(
-        document.querySelectorAll('button[aria-label^="Open control menu for post by"]')
-      )
+      const started = Date.now()
+      const seen = new Set()
       const posts = []
-      for (const btn of menuBtns) {
-        const label = btn.getAttribute('aria-label') || ''
-        const m = label.match(/Open control menu for post by (.+)/)
-        const authorName = m ? m[1].trim() : 'Unknown'
+      let scrolls = 0
+      let idle = 0
 
-        // Prefer the actual post root so the body element can be targeted;
-        // fall back to the legacy walk-up (first ancestor with enough text).
-        // The walk-up alone stops at a long author-header block and misses the
-        // body, which produced the "[Draft generation failed]" cards.
-        // `[componentkey]` is the server-driven feed's post container; the two
-        // legacy classes stopped matching entirely when LinkedIn moved the
-        // search feed to SDUI, which dropped every post back to the walk-up.
-        let root = btn.closest('.feed-shared-update-v2, [data-urn], [componentkey]')
-        if (root && (root.innerText || '').length < 150) root = null
-        if (!root) {
-          root = btn.parentElement
-          while (
-            root &&
-            root.tagName !== 'BODY' &&
-            (!root.innerText || root.innerText.length < 150)
-          ) {
-            root = root.parentElement
+      for (;;) {
+        const fresh = Array.from(document.querySelectorAll(HARVEST_MENU_SELECTOR)).filter((b) => !seen.has(b))
+        if (fresh.length > 0) {
+          idle = 0
+          fresh.forEach((b) => harvestExpandMore(harvestPostRoot(b)))
+          await harvestSleep(600)
+          for (const btn of fresh) {
+            seen.add(btn)
+            if (posts.length < HARVEST_TARGET) posts.push(harvestMeta(btn))
           }
+        } else {
+          idle++
         }
 
-        const context =
-          root && root.tagName !== 'BODY' ? (root.innerText || '').substring(0, 1500) : ''
-        const body = harvestExtractBody(root)
+        if (posts.length >= HARVEST_TARGET || idle >= 2 || scrolls >= HARVEST_MAX_SCROLLS) break
+        if (Date.now() - started > HARVEST_BUDGET_MS - 2500) break
 
-        let deg = 'none'
-        if (/·\s*1st/.test(context) || (context.indexOf(' 1st') > -1 && context.indexOf('1st connections') === -1)) deg = '1st'
-        else if (/·\s*2nd/.test(context) || context.indexOf(' 2nd') > -1) deg = '2nd'
-        else if (/·\s*3rd/.test(context) || context.indexOf(' 3rd') > -1) deg = '3rd+'
-
-        posts.push({ author_hint: authorName, context, body, menu_label: label, degree: deg })
-        if (posts.length >= 8) break
+        window.scrollBy(0, Math.max(1200, window.innerHeight * 1.5))
+        scrolls++
+        await harvestSleep(1800)
       }
-      return { posts }
+
+      return { posts, scrolls }
     } catch (e) {
       return { error: e.message, posts: [] }
     }
+  }
+
+  // Test hook. Content scripts run in an isolated world, so the page cannot
+  // see this; the Orca repo's jsdom tests use it to exercise the extraction.
+  window.__orcaHarvest = {
+    harvestPostRoot,
+    harvestExpandMore,
+    harvestExtractBody,
+    harvestBodyFromLines,
+    harvestPostUrns,
+    harvestMeta,
   }
 
   function harvestToastLinks() {
@@ -260,13 +345,15 @@
 
   // Resolve a post's canonical URL: open its control menu, click "Copy link",
   // read the toast's "View post" link. Returns { url } or { error }.
-  async function harvestResolveUrl(menuLabel) {
+  async function harvestResolveUrl(menuLabel, menuIndex) {
     try {
       if (!menuLabel) return { error: 'menuLabel required' }
 
-      const btn = Array.from(
-        document.querySelectorAll('button[aria-label^="Open control menu for post by"]')
-      ).find((b) => b.getAttribute('aria-label') === menuLabel)
+      // Two posts by the same author share a label, so the index picks which.
+      const matches = Array.from(document.querySelectorAll(HARVEST_MENU_SELECTOR)).filter(
+        (b) => b.getAttribute('aria-label') === menuLabel
+      )
+      const btn = matches[menuIndex || 0] || matches[0]
       if (!btn) return { error: 'menu button not found' }
 
       // Toasts stack and persist between posts, so a link that is already on
