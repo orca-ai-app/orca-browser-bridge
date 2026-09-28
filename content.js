@@ -56,6 +56,10 @@
         harvestResolveUrl(msg.menuLabel, msg.menuIndex).then(sendResponse)
         return true
 
+      case 'orca-profile-location':
+        harvestProfileLocation().then(sendResponse)
+        return true
+
       // LinkedIn messaging (godmode inbox triage) — runs in a BACKGROUND tab,
       // nothing here may assume window focus.
       case 'orca-linkedin-list-conversations':
@@ -237,6 +241,24 @@
     return 'none'
   }
 
+  // The author's profile or company page, so the app can look up where they
+  // are based. The search card itself shows name, degree, headline and time
+  // but no location, so the location needs one visit to this URL (cached by
+  // the app). Prefers the link whose text carries the author's name, since a
+  // reposted or tagged post has more than one profile link in it.
+  function harvestAuthorUrl(root, authorName) {
+    if (!root) return ''
+    const links = Array.from(root.querySelectorAll('a[href*="/in/"], a[href*="/company/"]'))
+    if (links.length === 0) return ''
+    const first = (authorName || '').split(/\s+/)[0].toLowerCase()
+    const named = first
+      ? links.find((a) => ((a.innerText || a.textContent || '') + ' ' + (a.getAttribute('aria-label') || '')).toLowerCase().indexOf(first) > -1)
+      : null
+    const href = (named || links[0]).href || ''
+    const m = href.match(/^(https?:\/\/[^/]*linkedin\.com\/(in|company)\/[^/?#]+)/i)
+    return m ? m[1] + '/' : ''
+  }
+
   function harvestMeta(btn) {
     const label = btn.getAttribute('aria-label') || ''
     const m = label.match(/Open control menu for post by (.+)/)
@@ -248,6 +270,7 @@
     )
     return {
       author_hint: authorName,
+      author_url: harvestAuthorUrl(root, authorName),
       context,
       body: harvestExtractBody(root),
       menu_label: label,
@@ -257,16 +280,33 @@
     }
   }
 
+  // What the page is, for the app's rate-limit / checkpoint / login check.
+  // The text sample is only sent when there is nothing else to read, so a
+  // post that happens to mention "too many requests" cannot stop a run.
+  function harvestPageInfo(includeText) {
+    return {
+      url: location.href,
+      title: document.title,
+      text: includeText ? ((document.body && document.body.innerText) || '').substring(0, 800) : '',
+    }
+  }
+
+  // A randomised pause, so scrolling does not tick like a metronome.
+  function harvestJitter(minMs, maxMs) {
+    return harvestSleep(minMs + Math.floor(Math.random() * (maxMs - minMs)))
+  }
+
   // Scroll progressively, expanding and reading posts as they load, until
   // HARVEST_TARGET posts are collected, two rounds in a row add nothing, or
   // the time budget is spent. Posts are read round by round so a feed that
   // unloads posts scrolled far out of view still keeps what it showed.
-  // Returns { posts: [{author_hint, context, body, menu_label, menu_index, urns, degree}], scrolls }.
+  // Returns { posts: [{author_hint, author_url, context, body, menu_label, menu_index, urns, degree}], scrolls, page }.
   // The background worker allows 28 s for this call (and Orca's bridge 30 s),
-  // so the budget below must stay well inside that.
+  // so the budget below must stay inside that. Scroll pauses are randomised
+  // (2-5 s) so a run does not read as a script; fewer scrolls fit as a result.
   const HARVEST_TARGET = 25
   const HARVEST_MAX_SCROLLS = 8
-  const HARVEST_BUDGET_MS = 19000
+  const HARVEST_BUDGET_MS = 23000
 
   async function harvestExtractMetas() {
     try {
@@ -291,16 +331,83 @@
         }
 
         if (posts.length >= HARVEST_TARGET || idle >= 2 || scrolls >= HARVEST_MAX_SCROLLS) break
-        if (Date.now() - started > HARVEST_BUDGET_MS - 2500) break
+        // Leave room for the longest pause plus one more read.
+        if (Date.now() - started > HARVEST_BUDGET_MS - 6000) break
 
         window.scrollBy(0, Math.max(1200, window.innerHeight * 1.5))
         scrolls++
-        await harvestSleep(1800)
+        await harvestJitter(2000, 5000)
       }
 
-      return { posts, scrolls }
+      return { posts, scrolls, page: harvestPageInfo(posts.length === 0) }
     } catch (e) {
-      return { error: e.message, posts: [] }
+      return { error: e.message, posts: [], page: harvestPageInfo(true) }
+    }
+  }
+
+  // Where the author of a harvested post is based, read from their profile
+  // (/in/...) or their company's About page (/company/.../about/), which the
+  // app opens in a background tab. Polls because the profile renders after
+  // load. Returns { kind, location, page }; location is null when not found.
+  //
+  // Text shape rather than class names, as with the search feed: on a person's
+  // top card the location is the line just before "Contact info"; on a
+  // company's About page it follows the "Headquarters" label.
+  function harvestLinesOf(el) {
+    return ((el && el.innerText) || '')
+      .split(String.fromCharCode(10))
+      .map((l) => l.replace(/[·•]/g, ' ').replace(/\s+/g, ' ').trim())
+      .filter((l) => l)
+  }
+
+  function harvestReadPersonLocation() {
+    const legacy = document.querySelector(
+      '.pv-text-details__left-panel .text-body-small.inline.t-black--light.break-words, main section span.text-body-small.inline.t-black--light.break-words'
+    )
+    if (legacy && legacy.innerText && legacy.innerText.trim()) return legacy.innerText.trim()
+
+    const contact = Array.from(document.querySelectorAll('main a, main button, main span')).find(
+      (el) => (el.innerText || '').trim() === 'Contact info'
+    )
+    if (!contact) return null
+    // Climb until the container holds more than the link itself.
+    let box = contact.parentElement
+    for (let i = 0; i < 4 && box; i++) {
+      const lines = harvestLinesOf(box)
+      const at = lines.indexOf('Contact info')
+      if (at > 0) return lines[at - 1]
+      const joined = lines.find((l) => /\s+Contact info$/.test(l))
+      if (joined) return joined.replace(/\s+Contact info$/, '').trim()
+      box = box.parentElement
+    }
+    return null
+  }
+
+  function harvestReadCompanyHq() {
+    const main = document.querySelector('main') || document.body
+    const labels = Array.from(main.querySelectorAll('dt, h3, span, div')).filter(
+      (el) => (el.innerText || '').trim() === 'Headquarters'
+    )
+    for (const label of labels) {
+      const dd = label.tagName === 'DT' ? label.nextElementSibling : null
+      if (dd && dd.innerText && dd.innerText.trim()) return dd.innerText.trim()
+    }
+    const lines = harvestLinesOf(main)
+    const at = lines.indexOf('Headquarters')
+    return at > -1 && lines[at + 1] ? lines[at + 1] : null
+  }
+
+  async function harvestProfileLocation() {
+    const kind = /\/company\//.test(location.pathname) ? 'company' : 'person'
+    try {
+      for (let i = 0; i < 16; i++) {
+        const found = kind === 'company' ? harvestReadCompanyHq() : harvestReadPersonLocation()
+        if (found) return { kind, location: found.substring(0, 200), page: harvestPageInfo(false) }
+        await harvestSleep(500)
+      }
+      return { kind, location: null, page: harvestPageInfo(true) }
+    } catch (e) {
+      return { kind, location: null, error: e.message, page: harvestPageInfo(true) }
     }
   }
 
@@ -313,6 +420,9 @@
     harvestBodyFromLines,
     harvestPostUrns,
     harvestMeta,
+    harvestAuthorUrl,
+    harvestReadPersonLocation,
+    harvestReadCompanyHq,
   }
 
   function harvestToastLinks() {

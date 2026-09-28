@@ -253,6 +253,9 @@ async function handleCommand(request) {
       case 'linkedin_resolve_url':
         return await cmdLinkedinResolveUrl(id, params)
 
+      case 'linkedin_profile_location':
+        return await cmdLinkedinProfileLocation(id, params)
+
       // LinkedIn messaging (godmode inbox triage) — background-tab, passive,
       // NEVER focuses a tab or window
       case 'linkedin_ensure_messaging_tab':
@@ -467,6 +470,15 @@ async function cmdLinkedinResolveUrl(id, params) {
   if (result && result.url) {
     result.url = await expandLinkedInShortlink(result.url)
   }
+  return success(id, result)
+}
+
+// Where a harvested post's author is based: the app opens their profile (or
+// company About page) in a background tab and asks for this, then closes the
+// tab. The content script polls for up to ~8 s while the page renders.
+async function cmdLinkedinProfileLocation(id, params) {
+  const tabId = await getTargetTabId(params)
+  const result = await sendToContentScript(tabId, 'orca-profile-location', {}, 15000)
   return success(id, result)
 }
 
