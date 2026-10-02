@@ -256,6 +256,9 @@ async function handleCommand(request) {
       case 'linkedin_profile_location':
         return await cmdLinkedinProfileLocation(id, params)
 
+      case 'linkedin_probe':
+        return await cmdLinkedinProbe(id)
+
       // LinkedIn messaging (godmode inbox triage) — background-tab, passive,
       // NEVER focuses a tab or window
       case 'linkedin_ensure_messaging_tab':
@@ -323,8 +326,32 @@ async function cmdGetActiveTab(id) {
   })
 }
 
+// Bring a harvest tab's window forward, un-minimised, and make the tab the
+// active one. Always the window the tab is already in: this never creates a
+// window or touches another profile, so the tab stays in the logged-in Chrome.
+//
+// WHY. Chrome throttles pages it considers hidden (a background tab, or a
+// window that is minimised or covered): timers are batched, and rendering,
+// and with it LinkedIn's infinite scroll, stops. The app asks for this only
+// overnight (linkedinHarvest.harvestMayFocusChrome), when nobody is using the
+// Mac; in the day the tab opens as the active tab but the window stays where
+// Chris put it, so the harvest never jumps in front of his work. If the
+// screen itself is off or locked, nothing an extension does makes a window
+// visible; the page reports its visibility so the app can say so.
+async function focusHarvestTab(tabId) {
+  try {
+    const tab = await chrome.tabs.update(tabId, { active: true })
+    const win = await chrome.windows.get(tab.windowId)
+    const update = { focused: true }
+    if (win.state === 'minimized') update.state = 'normal'
+    await chrome.windows.update(tab.windowId, update)
+  } catch (e) {
+    // Focus is a nicety; the page still loads and is read without it.
+  }
+}
+
 async function cmdOpenUrl(id, params) {
-  const { url, new_tab, background } = params || {}
+  const { url, new_tab, background, focus } = params || {}
   if (!url) return error(id, 'url is required')
 
   if (new_tab === false) {
@@ -337,6 +364,7 @@ async function cmdOpenUrl(id, params) {
   // background: true opens without stealing focus (PR listener X reads —
   // same passive pattern as the pinned LinkedIn messaging tab).
   const tab = await chrome.tabs.create({ url, active: background !== true })
+  if (focus === true && background !== true) await focusHarvestTab(tab.id)
   return success(id, { tabId: tab.id, url })
 }
 
@@ -451,6 +479,9 @@ async function cmdFillInput(id, params) {
 
 async function cmdLinkedinExtractMetas(id, params) {
   const tabId = await getTargetTabId(params)
+  // Overnight the app asks for the tab to be in front while it scrolls, so
+  // the page renders and loads more posts (see focusHarvestTab).
+  if (params?.focus === true) await focusHarvestTab(tabId)
   // Content script scrolls progressively (up to ~19 s) then reads the DOM.
   // Kept under Orca's 30 s bridge timeout.
   const result = await sendToContentScript(tabId, 'orca-extract-metas', {}, 28000)
@@ -480,6 +511,21 @@ async function cmdLinkedinProfileLocation(id, params) {
   const tabId = await getTargetTabId(params)
   const result = await sendToContentScript(tabId, 'orca-profile-location', {}, 15000)
   return success(id, result)
+}
+
+// Can Chrome reach LinkedIn, logged in? One GET of the feed with Chrome's own
+// cookies (no tab, nothing rendered), so the app can check before it starts a
+// harvest rather than discover a dead session half-way. Reports where the
+// request landed: a login, authwall or checkpoint URL means not logged in.
+async function cmdLinkedinProbe(id) {
+  try {
+    const res = await fetch('https://www.linkedin.com/feed/', { method: 'GET', redirect: 'follow', credentials: 'include' })
+    const finalUrl = (res.url || '').split('?')[0]
+    const loggedIn = !/\/(login|uas\/login|authwall|signup|checkpoint)(\/|$)/i.test(finalUrl)
+    return success(id, { ok: res.ok, status: res.status, url: finalUrl, loggedIn })
+  } catch (e) {
+    return success(id, { ok: false, status: 0, error: e.message })
+  }
 }
 
 // "Copy link to post" yields an lnkd.in shortlink, which carries no activity

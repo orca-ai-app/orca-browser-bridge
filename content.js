@@ -288,6 +288,10 @@
       url: location.href,
       title: document.title,
       text: includeText ? ((document.body && document.body.innerText) || '').substring(0, 800) : '',
+      // 'hidden' means Chrome was not showing this page while it was read
+      // (background tab, or a window minimised, covered or on a sleeping
+      // screen): LinkedIn then loads fewer posts. Reported, not acted on.
+      visibility: document.visibilityState,
     }
   }
 
